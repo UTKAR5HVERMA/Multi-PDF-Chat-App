@@ -1,21 +1,19 @@
 import os
 from dotenv import load_dotenv
 import ollama
-import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS
 from langchain.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 import streamlit as st
-
+from langchain.llms import Ollama
 load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
 
 def get_pdf_text(pdf_docs):
-    text=""
+    text = ""
     for doc in pdf_docs:
         pdf_reader = PdfReader(doc)
         for page in pdf_reader.pages:
@@ -23,77 +21,105 @@ def get_pdf_text(pdf_docs):
     return text
 
 def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=50000, chunk_overlap=1000)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_text(text)
     return chunks
-
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings import HuggingFaceEmbeddings
 
 def get_vector_store(text_chunks):
-    emembedding = ollama.embed(
-    model='mxbai-embed-large',
-    # text=text_chunks
-)
-    vector_store = FAISS.from_texts(text_chunks,embedding=emembedding)
-    vector_store.save_local("faiss_index")
-    
-    
-def get_conversational_Chain():
-    Prompt_template = """
-     Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
+    try:
+        # Load the SentenceTransformer model
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+
+        # Generate embeddings for each chunk
+        embeddings = [model.encode(chunk, convert_to_tensor=False) for chunk in text_chunks]
+
+        # Convert the embeddings to the format required by FAISS
+        embedding_function = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+
+        # Create a FAISS vector store
+        vector_store = FAISS.from_texts(text_chunks, embedding_function)
+
+        # Save the vector store locally
+        vector_store.save_local("faiss_index")
+        st.success("Vector store created successfully!")
+    except Exception as e:
+        st.error(f"Failed to create vector store: {e}")
+
+# def get_vector_store(text_chunks):
+#     try:
+#         model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')  # Force using CPU
+        
+#         def embed_fn(texts):
+#             return model.encode(texts, convert_to_tensor=False).tolist()
+
+#         vector_store = FAISS.from_texts(text_chunks, embedding=embed_fn)
+#         vector_store.save_local("faiss_index")
+#         st.success("Vector store created successfully!")
+#     except Exception as e:
+#         st.error(f"Failed to create vector store: {e}")
+
+def get_conversational_chain():
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context. 
+    If the answer is not in the provided context, say "Answer is not available in the context." 
+    Do not provide a wrong answer.
+
+    Context:
+    {context}
+
+    Question:
+    {question}
 
     Answer:
     """
-    model = ollama.chat(model="llama3.2")
-    prompt = PromptTemplate(template = Prompt_template, input_variables = ["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    
+    model = Ollama(model="llama3.2")
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    chain = load_qa_chain(llm=model, chain_type="stuff", prompt=prompt)
+
     return chain
+    # prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    # chain = load_qa_chain(ollama.chat(model="llama3.2"), chain_type="stuff", prompt=prompt)
+    # return chain
 
 def user_input(user_question):
-    embeddings = ollama.embed(model = "mxbai-embed-large")
-    
-    new_db = FAISS.load_local("faiss_index", embeddings)
-    docs = new_db.similarity_search(user_question)
+    try:
+        # Load the embedding model
+        # model = SentenceTransformer('all-MiniLM-L6-v2')
+        embedding = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+        # Load the FAISS vector store with the dangerous deserialization flag
+        new_db = FAISS.load_local("faiss_index", embeddings=embedding,allow_dangerous_deserialization=True)
 
-    chain = get_conversational_Chain()
+        # Perform similarity search
+        docs = new_db.similarity_search(user_question)
 
-    
-    response = chain(
-        {"input_documents":docs, "question": user_question}
-        , return_only_outputs=True)
-    print(response)
-    st.write(response)
-    
+        # Get the conversational chain
+        chain = get_conversational_chain()
+        print(user_question)
+        response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
+
+        st.write(response)
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
+
 def main():
-    st.set_page_config("Multi PDF Chatbot", page_icon = ":scroll:")
-    st.header("Multi-PDF's 📚 - Chat Agent 🤖 ")
-
-    user_question = st.text_input("Ask a Question from the PDF Files uploaded .. ✍️📝")
-
-    if user_question:
-        user_input(user_question)
+    st.set_page_config("Multi PDF Chatbot", page_icon=":scroll:")
+    st.header("Multi-PDF Chatbot 🤖")
 
     with st.sidebar:
+        st.title("📁 PDF Upload Section")
+        pdf_docs = st.file_uploader("Upload your PDF files:", accept_multiple_files=True)
+        if st.button("Process PDFs"):
+            with st.spinner("Processing..."):
+                raw_text = get_pdf_text(pdf_docs)
+                text_chunks = get_text_chunks(raw_text)
+                get_vector_store(text_chunks)
+                st.success("Processing Complete!")
 
-        # st.image("img/Robot.jpg")
-        st.write("---")
-        
-        st.title("📁 PDF File's Section")
-        pdf_docs = st.file_uploader("Upload your PDF Files & \n Click on the Submit & Process Button ", accept_multiple_files=True)
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."): # user friendly message.
-                raw_text = get_pdf_text(pdf_docs) # get the pdf text
-                text_chunks = get_text_chunks(raw_text) # get the text chunks
-                get_vector_store(text_chunks) # create vector store
-                st.success("Done")
-        
-        st.write("---")
-        # st.image("img/gkj.jpg")
-        st.write("AI App created by @ Gurpreet Kaur")  # add this line to display the image
-
+    user_question = st.text_input("Ask a Question:")
+    if user_question:
+        user_input(user_question)
 
     st.markdown(
         """
